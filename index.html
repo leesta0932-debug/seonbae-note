@@ -2,6 +2,7 @@
 <title>선배노트 시제품</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.99.3/dist/umd/supabase.js"></script>
 <style>
 /* 레이아웃: 폰은 위 헤더 + 아래 탭바 한 줄, 넓은 화면(760px 이상)은 왼쪽 메뉴 + 분류·목록·상세 3단 */
 :root{
@@ -297,7 +298,7 @@ const findQ = id => store.questions.find(q => q.id === id);
 const findA = (qid, aid) => findQ(qid).answers.find(a => a.id === aid);
 const pendingCodes = {};   // 시제품용 인증 코드 보관. 실제로는 Supabase가 메일로 보내고 확인한다.
 
-const api = {
+const demoApi = {
   async loadAll(){ return true; },   // DB 연결 시: 테이블을 불러와 store를 채운다
   /* 로그인. DB 연결 시 keep이 false면 세션을 sessionStorage에 저장해 브라우저를 닫으면 로그아웃되게 한다. */
   async login(email, pw, keep){
@@ -364,8 +365,164 @@ const api = {
   },
   async removeNotice(id){ store.notices = store.notices.filter(n => n.id !== id); },
   async addLog(l){ store.logs.unshift({id:nid(), ...l}); },
-  async setLogGuide(t){ store.logGuide = t; }
+  async setLogGuide(t){ store.logGuide = t; },
+  async checkPassword(email, pw){ return findUser(email)?.pw === pw; },
+  async logout(){}
 };
+
+/* ===== Supabase 연결 =====
+   github.io에서 열면(또는 주소 끝에 ?db=1) 실제 DB를 쓰고, 그 밖(Claude 미리보기 등)에서는 위 예시 데이터로 돌아간다.
+   권한(누가 무엇을 쓸 수 있는지)은 DB의 보안 규칙이 막으므로, 화면 코드를 고쳐도 규칙을 넘을 수 없다. */
+const SB_URL = "https://vvyatczocsgowfnknuzb.supabase.co";
+const SB_KEY = "sb_publishable_A7t_25aw7Xheoem3juaaOA_HJS2L4jd";   // 공개용 키라 코드에 있어도 된다
+const DB = !!window.supabase && (location.hostname.endsWith("github.io") || /[?&]db=1/.test(location.search));
+// '로그인 상태 유지'를 체크하면 localStorage(브라우저를 닫아도 유지), 아니면 sessionStorage(닫으면 로그아웃)
+const authStorage = {
+  getItem(k){ try { return localStorage.getItem(k) ?? sessionStorage.getItem(k); } catch(e){ return null; } },
+  setItem(k, v){ try { const keep = localStorage.getItem("sbn-keep") === "1";
+    (keep ? localStorage : sessionStorage).setItem(k, v); (keep ? sessionStorage : localStorage).removeItem(k); } catch(e){} },
+  removeItem(k){ try { localStorage.removeItem(k); sessionStorage.removeItem(k); } catch(e){} }
+};
+const sb = DB ? window.supabase.createClient(SB_URL, SB_KEY, {auth:{storage:authStorage, persistSession:true, autoRefreshToken:true}}) : null;
+let idToEmail = {}, emailToId = {};
+const emOf = id => idToEmail[id] || null;
+const idOf = email => emailToId[email] || null;
+const ms = t => t ? Date.parse(t) : null;
+const setKeep = on => { try { localStorage.setItem("sbn-keep", on ? "1" : "0"); } catch(e){} };
+/* DB 요청 하나를 실행한다. 실패하면 알리고 멈춘다(성공 안내가 뜨지 않게). */
+async function run(p){
+  const {data, error} = await p;
+  if(error){ console.error(error); toast("저장하지 못했어요. 잠시 뒤 다시 해 주세요"); const e = new Error(error.message); e.sb = true; throw e; }
+  return data;
+}
+addEventListener("unhandledrejection", e => { if(e.reason?.sb) e.preventDefault(); });
+const clearStore = () => Object.assign(store, {users:[], roster:[], teacherEmails:[], questions:[], reviews:[], notices:[], logs:[]});
+
+const dbApi = {
+  /* 테이블을 모두 불러와 store를 화면이 쓰는 모양으로 채운다. 로그인한 사람의 이메일을 돌려준다. */
+  async loadAll(){
+    const {data:{session}} = await sb.auth.getSession();
+    if(!session){ clearStore(); return false; }
+    const [profiles, questions, answers, sups, flags, reviews, reports, notices, logs, settings] = await Promise.all([
+      run(sb.from("profiles").select("id,email,name,role,grade,mentor")),
+      run(sb.from("questions").select("*").order("created_at", {ascending:false})),
+      run(sb.rpc("list_answers")),
+      run(sb.from("supplements").select("*").order("created_at")),
+      run(sb.from("answer_flags").select("*").order("created_at")),
+      run(sb.from("reviews").select("*").order("created_at", {ascending:false})),
+      run(sb.from("review_reports").select("*")),
+      run(sb.from("notices").select("*").order("created_at", {ascending:false})),
+      run(sb.from("logs").select("*").order("log_date", {ascending:false}).order("created_at", {ascending:false})),
+      run(sb.from("settings").select("*"))
+    ]);
+    idToEmail = {}; emailToId = {};
+    profiles.forEach(p => { idToEmail[p.id] = p.email; emailToId[p.email] = p.id; });
+    store.users = profiles.map(p => ({...p}));
+    const meP = profiles.find(p => p.id === session.user.id);
+    if(meP?.role === "teacher"){
+      const [ro, te] = await Promise.all([run(sb.from("roster").select("email,grade,name").order("added_at")), run(sb.from("teacher_emails").select("email"))]);
+      store.roster = ro; store.teacherEmails = te.map(t => t.email);
+    } else { store.roster = []; store.teacherEmails = []; }
+    store.questions = questions.map(x => ({id:x.id, grade:x.grade, subject:x.subject, stuck:x.stuck, title:x.title, body:x.body,
+      image:x.image, author:emOf(x.author), at:ms(x.created_at), assignedTo:emOf(x.assigned_to), answers:[]}));
+    const byQ = Object.fromEntries(store.questions.map(x => [x.id, x])), byA = {};
+    answers.forEach(a => {
+      const o = ans(a.id, emOf(a.author), a.body ?? "", ms(a.created_at), {image:a.image, status:a.status, revisedAt:ms(a.revised_at),
+        hide: a.hide_reason ? {reason:a.hide_reason, memo:a.hide_memo || "", by:emOf(a.hidden_by), at:ms(a.hidden_at)} : null,
+        revision: a.revision_at ? {note:a.revision_note || "", by:emOf(a.revision_by), at:ms(a.revision_at)} : null,
+        confirmed: a.confirmed_by ? {by:emOf(a.confirmed_by), at:ms(a.confirmed_at)} : null});
+      byA[a.id] = o; byQ[a.question_id]?.answers.push(o);
+    });
+    sups.forEach(s => byA[s.answer_id]?.supplements.push({by:emOf(s.author), text:s.body, at:ms(s.created_at)}));
+    flags.forEach(f => { const a = byA[f.answer_id]; if(!a) return;
+      if(f.kind === "confused") a.confusedBy.push(emOf(f.author)); else a.corrections.push({by:emOf(f.author), note:f.note || "", at:ms(f.created_at)}); });
+    const byR = {};
+    store.reviews = reviews.map(r => (byR[r.id] = {id:r.id, subject:r.subject, grade:r.grade, diff:r.diff, date:fmtDate(ms(r.created_at)),
+      by:r.by_label, hidden:r.hidden, tip:r.tip, fit:r.fit || "누구나", reports:[]}));
+    reports.forEach(r => byR[r.review_id]?.reports.push({by:emOf(r.author), reason:r.reason, at:ms(r.created_at)}));
+    store.notices = notices.map(n => ({id:n.id, grade:n.grade, subject:n.subject, text:n.body, by:emOf(n.author), at:ms(n.created_at)}));
+    store.logs = logs.map(l => ({id:l.id, owner:emOf(l.owner), auto:l.auto, date:l.log_date, title:l.title, kind:l.kind || "",
+      did:l.did || "", learn:l.learn || "", next:l.next || ""}));
+    const g = settings.find(s => s.key === "log_guide"); if(g) store.logGuide = g.value;
+    return meP ? meP.email : false;
+  },
+  async login(email, pw, keep){
+    email = email.trim().toLowerCase(); setKeep(keep);
+    const {error} = await sb.auth.signInWithPassword({email, password:pw});
+    if(error) return {error:"이메일이나 비밀번호가 맞지 않아요. 처음이라면 아래 '회원가입'을 눌러 주세요."};
+    const e = await dbApi.loadAll(), u = e && findUser(e);
+    if(!u){ await sb.auth.signOut(); return {error:"회원 정보를 찾을 수 없어요. 담당 선생님께 문의해 주세요."}; }
+    return {user:u};
+  },
+  async checkSignup(email, role){
+    if(!isSchoolEmail(email)) return {error:`${DOMAIN} 로 끝나는 학교 이메일을 입력하세요.`};
+    const {data, error} = await sb.rpc("can_sign_up", {p_email:email});
+    if(error) return {error:"확인하지 못했어요. 잠시 뒤 다시 해 주세요."};
+    if(data === "not_school") return {error:`${DOMAIN} 로 끝나는 학교 이메일을 입력하세요.`};
+    if(data === "exists") return {error:"이미 가입한 이메일이에요. 로그인해 주세요."};
+    if(role === "teacher"){
+      if(data !== "teacher") return {error: data === "student" ? "학생 명단에 있는 이메일이에요. 위에서 '학생'을 골라 주세요."
+        : "등록된 선생님 이메일이 아니에요. 이미 가입한 선생님께 관리 탭에서 등록해 달라고 요청하세요."};
+    } else {
+      if(data === "teacher") return {error:"선생님으로 등록된 이메일이에요. 위에서 '선생님'을 골라 주세요."};
+      if(data !== "student") return {error:"선생님이 등록한 학생 명단에 없는 이메일이에요. 이메일을 다시 확인하고, 맞다면 담당 선생님께 명단 등록을 요청하세요."};
+    }
+    return {ok:true};
+  },
+  // 시연 기간에는 이메일 인증을 꺼 두었다. 메일 발송 서비스를 붙이면 인증번호 단계를 다시 켠다.
+  async sendCode(){ return null; },
+  async verifyCode(){ return true; },
+  async createAccount(email, role, pw, name){
+    setKeep(false);
+    const {data, error} = await sb.auth.signUp({email, password:pw, options:{data:{name: role === "teacher" ? `${name} 선생님` : ""}}});
+    if(error || !data.session){ toast(error && /registered|exists/i.test(error.message) ? "이미 가입한 이메일이에요. 로그인해 주세요" : "가입하지 못했어요. 명단과 이메일을 다시 확인해 주세요");
+      const e = new Error("signup"); e.sb = true; throw e; }
+    const e = await dbApi.loadAll(); return findUser(e);
+  },
+  async resetPassword(){},
+  async checkPassword(email, pw){ const {error} = await sb.auth.signInWithPassword({email, password:pw}); return !error; },
+  async changePassword(email, next){ await run(sb.auth.updateUser({password:next})); },
+  async logout(){ await sb.auth.signOut(); clearStore(); },
+  async addRoster(rows){
+    const data = await run(sb.from("roster").upsert(rows, {onConflict:"email", ignoreDuplicates:true}).select("email"));
+    await dbApi.loadAll(); return {added:data.length, dup:rows.length - data.length};
+  },
+  async addQuestion(x){
+    const d = await run(sb.from("questions").insert({grade:x.grade, subject:x.subject, stuck:x.stuck, title:x.title, body:x.body, image:x.image || null}).select("id").single());
+    await dbApi.loadAll(); return d.id;
+  },
+  async addAnswer(qid, author, text, image){ await run(sb.from("answers").insert({question_id:qid, body:text, image:image || null})); await dbApi.loadAll(); },
+  async confirmAnswer(qid, aid){ await run(sb.rpc("confirm_answer", {p_answer:aid})); await run(sb.from("answer_flags").delete().eq("answer_id", aid)); await dbApi.loadAll(); },
+  async addSupplement(qid, aid, by, text){ await run(sb.from("supplements").insert({answer_id:aid, body:text})); await dbApi.loadAll(); },
+  async hideAnswer(qid, aid, by, reason, memo){ await run(sb.rpc("hide_answer", {p_answer:aid, p_reason:reason, p_memo:memo || null})); await dbApi.loadAll(); },
+  async requestRevision(qid, aid, by, note){ await run(sb.rpc("request_revision", {p_answer:aid, p_note:note})); await dbApi.loadAll(); },
+  async submitRevision(qid, aid, text){ await run(sb.rpc("submit_revision", {p_answer:aid, p_body:text})); await dbApi.loadAll(); },
+  async restoreAnswer(qid, aid){ await run(sb.rpc("restore_answer", {p_answer:aid})); await dbApi.loadAll(); },
+  async deleteAnswer(qid, aid){ await run(sb.from("answers").delete().eq("id", aid)); await dbApi.loadAll(); },
+  async toggleConfused(qid, aid, email){
+    if(findA(qid, aid).confusedBy.includes(email))
+      await run(sb.from("answer_flags").delete().eq("answer_id", aid).eq("author", idOf(email)).eq("kind", "confused"));
+    else await run(sb.from("answer_flags").insert({answer_id:aid, kind:"confused"}));
+    await dbApi.loadAll();
+  },
+  async requestCorrection(qid, aid, by, note){ await run(sb.from("answer_flags").insert({answer_id:aid, kind:"correction", note})); await dbApi.loadAll(); },
+  async clearFlags(qid, aid){ await run(sb.from("answer_flags").delete().eq("answer_id", aid)); await dbApi.loadAll(); },
+  async assignQuestion(qid, email){ await run(sb.rpc("assign_question", {p_question:qid, p_mentor: email ? idOf(email) : null})); await dbApi.loadAll(); },
+  async setMentor(email, on){ await run(sb.rpc("set_mentor", {p_user:idOf(email), p_on:on})); await dbApi.loadAll(); },
+  async addReview(r){ await run(sb.from("reviews").insert({subject:r.subject, grade:r.grade || null, diff:r.diff, by_label:r.by, tip:r.tip, fit:r.fit})); await dbApi.loadAll(); },
+  async setReviewHidden(id, hidden){ await run(sb.rpc("set_review_hidden", {p_review:id, p_hidden:hidden})); await dbApi.loadAll(); },
+  async reportReview(id, by, reason){ await run(sb.from("review_reports").insert({review_id:id, reason})); await dbApi.loadAll(); },
+  async clearReviewReports(id){ await run(sb.from("review_reports").delete().eq("review_id", id)); await dbApi.loadAll(); },
+  async addTeacherEmail(email){ await run(sb.from("teacher_emails").insert({email})); await dbApi.loadAll(); },
+  async setNotice(grade, subject, text){
+    await run(sb.from("notices").upsert({grade, subject, body:text, author:idOf(S.me), created_at:new Date().toISOString()}, {onConflict:"grade,subject"}));
+    await dbApi.loadAll();
+  },
+  async removeNotice(id){ await run(sb.from("notices").delete().eq("id", id)); await dbApi.loadAll(); },
+  async addLog(l){ await run(sb.from("logs").insert({log_date:l.date, title:l.title, kind:l.kind, did:l.did, learn:l.learn, next:l.next})); await dbApi.loadAll(); },
+  async setLogGuide(t){ await run(sb.from("settings").upsert({key:"log_guide", value:t})); await dbApi.loadAll(); }
+};
+const api = DB ? dbApi : demoApi;
 
 /* ===== 화면 상태 ===== */
 const S = {me:null, auth:"login", flow:null, draft:{}, tab:"home", grade:2, subject:"전체", view:null, sel:null, ui:null,
@@ -852,7 +1009,7 @@ document.addEventListener("click", async e => {
       S.flow = v === "signup" ? {purpose:"signup", role:"student", email:""} : v === "reset" ? {purpose:"reset", email:""} : null; break;
     case "srole": S.flow.email = $("#semail").value; S.flow.role = v; break;
     case "resend": S.flow.code = await api.sendCode(S.flow.email); toast("인증 메일을 다시 보냈어요"); break;
-    case "logout": Object.assign(S, {me:null, auth:"login", flow:null, view:null, sel:null, ui:null, tab:"home", draft:{}, qsearch:"", rosterMsg:""}); break;
+    case "logout": await api.logout(); Object.assign(S, {me:null, auth:"login", flow:null, view:null, sel:null, ui:null, tab:"home", draft:{}, qsearch:"", rosterMsg:""}); break;
     case "tab": S.tab = v; S.view = null; S.ui = null; S.sel = null; S.qsearch = ""; break;
     case "account": S.view = {type:"account"}; S.ui = null; break;
     case "back": S.view = null; S.ui = null; break;
@@ -900,10 +1057,12 @@ document.addEventListener("submit", async e => {
     case "signup": {
       const email = val("semail").toLowerCase(); S.flow.email = email;
       const r = await api.checkSignup(email, S.flow.role); if(r.error) return fail(r.error);
+      if(DB){ S.auth = "setpw"; break; }   // 시연 기간: 인증 메일 없이 바로 비밀번호 정하기
       S.flow.code = await api.sendCode(email); S.auth = "verify"; toast("인증 메일을 보냈어요"); break;
     }
     case "reset": {
       const email = val("remail").toLowerCase(); S.flow.email = email;
+      if(DB) return fail("시연 기간에는 비밀번호 찾기를 쓸 수 없어요. 담당 선생님께 문의해 주세요.");
       if(!findUser(email)) return fail("가입하지 않은 이메일이에요. 이메일을 다시 확인해 주세요.");
       S.flow.code = await api.sendCode(email); S.auth = "verify"; toast("인증 메일을 보냈어요"); break;
     }
@@ -922,7 +1081,7 @@ document.addEventListener("submit", async e => {
       break;
     }
     case "changePw": {
-      if(raw("cp") !== u.pw) return fail("현재 비밀번호가 맞지 않아요.");
+      if(!(await api.checkPassword(u.email, raw("cp")))) return fail("현재 비밀번호가 맞지 않아요.");
       const p = pwProblem(raw("np"), raw("np2")); if(p) return fail(p);
       await api.changePassword(u.email, raw("np")); S.view = null; toast("비밀번호를 바꿨어요"); break;
     }
@@ -1018,7 +1177,13 @@ mq.addEventListener?.("change", () => {
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => render());
 
-render();
+if(DB){
+  // 예시 데이터는 비우고, 이미 로그인해 둔 세션이 있으면 바로 들어간다
+  clearStore();
+  $("#app").innerHTML = '<p class="note" style="padding:48px 16px;text-align:center">불러오는 중…</p>';
+  dbApi.loadAll().then(e => { const u = e && findUser(e); if(u) Object.assign(S, {me:u.email, grade:u.grade || 2}); })
+    .catch(() => {}).finally(render);
+} else render();
 </script>
 
 </body></html>
